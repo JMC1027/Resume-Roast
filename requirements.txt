@@ -1,0 +1,4 @@
+anthropic
+gradio>=4.0
+pdfplumber
+python-dotenv
