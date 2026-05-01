@@ -1,200 +1,358 @@
-# ─────────────────────────────────────────────
+
 #  Resume Roast
-#  Uploads a PDF resume, extracts the text, and
+#  Uploads a PDF resume, extracts the text,
 #  sends it to Claude for a scored, playful-but-
 #  honest analysis. The UI is built with Gradio.
-# ─────────────────────────────────────────────
 
-import gradio as gr          # Gradio: builds the web UI
-import anthropic             # Anthropic SDK: talks to Claude
-import pdfplumber            # pdfplumber: extracts text from PDF files
-from dotenv import load_dotenv  # python-dotenv: loads API key from .env file
+import os
+import gradio as gr
+import anthropic
+import pdfplumber
+from dotenv import load_dotenv
 
-# Load environment variables from the .env file so that
-# ANTHROPIC_API_KEY is available without hardcoding it in source code.
+# Load ANTHROPIC_API_KEY from .env
 load_dotenv()
 
-# Create the Anthropic client. It automatically reads ANTHROPIC_API_KEY
-# from the environment — no need to pass the key explicitly.
+# Anthropic client — reads ANTHROPIC_API_KEY from environment automatically
 client = anthropic.Anthropic()
 
-# ─────────────────────────────────────────────
-#  SYSTEM PROMPT
-#  This is the instruction set sent to Claude
-#  before every resume. It defines Claude's
-#  persona, the exact output format we expect,
-#  the scoring rubric, and the desired tone.
-# ─────────────────────────────────────────────
-SYSTEM_PROMPT = """\
-You are Resume Roast — a brutally honest, secretly supportive career coach with the wit of a stand-up \
-comedian and the eye of a senior hiring manager who has seen it all.
 
-Analyze the resume and respond in this EXACT format (no deviation):
+#  SYSTEM PROMPT
+#  Defines Claude's persona, output format,
+#  scoring rubric, and tone for every roast.
+
+SYSTEM_PROMPT = """\
+You are Resume Roast — a career coach who has reviewed 10,000 resumes and has lost all patience \
+for mediocrity. You are funny, brutally direct, and occasionally savage, but everything you say \
+is TRUE and USEFUL. Think: if a very smart, slightly mean best friend who works in HR reviewed \
+your resume after two espressos.
+
+Your goal: make them laugh, make them wince, and make them actually fix their resume.
+
+Analyze the resume and respond in this EXACT format:
 
 ## SCORE: X/10
 
-**The Roast:** [One punchy sentence that captures the biggest flaw — make it sting, but keep it true]
+**Verdict:** [One sentence. Make it land. This should be quotable — the kind of thing they screenshot \
+and send to their friends. No softening, no hedging.]
 
 ---
 
-### The Good
-[2-3 specific genuine strengths. No hollow compliments — cite actual content from the resume]
+### What's Actually Working
+[2-3 genuine strengths. Be specific — quote their resume back at them. If there's genuinely \
+nothing good, say so. Don't invent strengths to be nice.]
 
-### The Bad
-[2-3 real problems holding this person back. Be specific, not vague. "Weak action verbs" is vague; \
-"'Assisted with' on every bullet tells me nothing about your actual impact" is specific]
+### What's Killing Your Chances
+[2-3 specific problems. Name the exact thing that's wrong. "Your summary reads like a LinkedIn \
+template you filled in at 11pm" is useful. "Needs improvement" is not.]
 
-### The Ugly
-[The single most cringe-worthy thing on this resume — the thing that made you do a double-take]
+### The Facepalm Moment
+[The single thing that made you stop and stare. One specific, unambiguous call-out. \
+Could be formatting, could be a claim, could be a typo. Make it hurt — lovingly.]
 
-### Glow-Up Tips
-1. [Specific, actionable fix — not "improve your skills"]
-2. [Specific, actionable fix]
-3. [Specific, actionable fix]
+### Fix These First
+1. [Concrete action — specific enough that they can do it today]
+2. [Concrete action]
+3. [Concrete action]
 
 ---
 
-Scoring guide (be stingy):
-- 1-3: Needs a complete overhaul before it should be sent to anyone
-- 4-5: Below average — a hiring manager skips this in 6 seconds
-- 6-7: Gets the interview sometimes, but leaves points on the table
-- 8-9: Strong resume with a couple of fixable issues
-- 10: Reserved for near-perfection (if you give this out freely, you're lying)
+Scoring (be honest, not generous):
+- 1–3: Do not send this to anyone. Seriously.
+- 4–5: You'll get ignored by 9 out of 10 hiring managers
+- 6–7: Gets a look sometimes. Leaves real opportunity on the table.
+- 8–9: Solid. A few tweaks from genuinely impressive.
+- 10: Basically perfect. You don't need this app.
 
-Tone: You're the Gordon Ramsay of career coaching. Harsh but never cruel. \
-Specific, never generic. You roast the resume, not the person.\
+Tone rules:
+- Sarcasm is allowed. Cruelty is not.
+- Every joke should have a point.
+- Never pad. Never hedge. Never say "consider" when you mean "do this."
+- You are roasting the resume. The person is trying their best. Keep that in mind.\
 """
+
+
+def show_filename(file) -> str:
+    if file is None:
+        return ""
+    return f"📄 {os.path.basename(file if isinstance(file, str) else file.name)}"
 
 
 def extract_text(file_path: str) -> str:
     """
-    Opens a PDF file and extracts all readable text from every page.
-
-    pdfplumber works on text-based PDFs (the kind exported from Word,
-    Google Docs, etc.). Scanned image-only PDFs return empty strings
-    because there is no embedded text layer to extract.
-
-    Returns a single string with all pages joined by newlines,
-    with leading/trailing whitespace removed.
+    Extracts all readable text from a PDF, page by page.
+    Returns empty string for scanned/image-only PDFs.
     """
     with pdfplumber.open(file_path) as pdf:
-        # Extract text from each page; fall back to "" if a page has no text
         pages = [page.extract_text() or "" for page in pdf.pages]
     return "\n".join(pages).strip()
 
 
 def roast_resume(file):
     """
-    Generator function that streams Claude's resume analysis back to the UI.
-
-    Gradio supports generator functions: every time we `yield` a value,
-    the UI updates in real time. This gives users live streaming output
-    instead of waiting for the full response before seeing anything.
-
-    Steps:
-      1. Guard against no file being uploaded.
-      2. Extract text from the PDF.
-      3. Send the text to Claude with a streaming API call.
-      4. Yield each text chunk as it arrives so the UI updates token-by-token.
+    Generator that streams Claude's roast back to the Gradio UI token by token.
+    Each yield updates the output in real time.
     """
 
-    # Step 1: Make sure the user actually uploaded something
     if file is None:
-        yield "Upload a resume PDF above and hit the button to get roasted!"
+        yield "Drop a PDF above and brace yourself."
         return
 
-    # Gradio 4.x passes the file path as a plain string (type="filepath").
-    # Older versions passed a file-like object with a .name attribute.
-    # This handles both cases gracefully.
+    # Gradio 4.x passes filepath as string; older versions used a file object
     file_path = file if isinstance(file, str) else file.name
 
-    # Step 2: Pull the text out of the PDF
     try:
         resume_text = extract_text(file_path)
     except Exception as e:
-        # Catches corrupt files, password-protected PDFs, etc.
         yield f"Couldn't read that PDF: {e}"
         return
 
-    # If extraction succeeded but returned nothing, the PDF is likely a
-    # scanned image with no embedded text layer — we can't process it.
     if not resume_text:
-        yield "This PDF has no readable text. Scan-only PDFs aren't supported — export a text-based PDF and try again."
+        yield "This PDF has no readable text — it's probably a scanned image. Export a real PDF and try again."
         return
 
-    # Step 3 & 4: Stream the Claude response and yield each chunk to the UI
-    result = ""  # Accumulates the full response as chunks arrive
+    result = ""
     try:
         with client.messages.stream(
-            model="claude-opus-4-7",   # Most capable Claude model
-            max_tokens=1024,           # Enough for a thorough roast
-            thinking={"type": "adaptive"},  # Lets Claude reason before responding
-            system=SYSTEM_PROMPT,      # Persona + format instructions (sent once)
+            model="claude-opus-4-7",          # Most capable Claude model
+            max_tokens=1024,                  # Enough for a thorough roast
+            thinking={"type": "adaptive"},    # Claude reasons before responding
+            system=SYSTEM_PROMPT,
             messages=[{
                 "role": "user",
-                # The actual resume text is passed here as the user message
-                "content": f"Here is the resume to roast:\n\n{resume_text}"
+                "content": f"Here is the resume:\n\n{resume_text}"
             }]
         ) as stream:
-            # stream.text_stream yields only the visible text tokens,
-            # filtering out internal "thinking" blocks automatically.
+            # text_stream skips thinking blocks — only yields visible output
             for text in stream.text_stream:
-                result += text   # Append new chunk to the running result
-                yield result     # Push the updated result to the Gradio UI
+                result += text
+                yield result
 
     except anthropic.AuthenticationError:
-        # Triggered when ANTHROPIC_API_KEY is missing or invalid
         yield "Invalid API key. Set `ANTHROPIC_API_KEY` in your `.env` file."
     except anthropic.APIError as e:
-        # Catches all other API-level errors (rate limits, server errors, etc.)
         yield f"API error: {e}"
 
 
 # ─────────────────────────────────────────────
+#  CUSTOM CSS
+#  Styles the page beyond what Gradio's theme
+#  provides — fonts, colors, layout tweaks,
+#  button animation, and output card styling.
+# ─────────────────────────────────────────────
+CSS = """
+/* Import a bold display font from Google Fonts */
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Inter:wght@400;500&display=swap');
+
+/* Root page */
+body, .gradio-container {
+    background: #0f0f0f !important;
+    color: #f0f0f0 !important;
+    font-family: 'Inter', sans-serif !important;
+}
+
+/* Big headline */
+#headline h1 {
+    font-family: 'Syne', sans-serif !important;
+    font-size: 3.2rem !important;
+    font-weight: 800 !important;
+    background: linear-gradient(90deg, #ff6b35, #ff4500);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.2rem !important;
+}
+
+#headline p, #headline h3 {
+    color: #bbb !important;
+    font-size: 1rem !important;
+    font-weight: 400 !important;
+}
+
+/* Upload button (gr.UploadButton) */
+#file-upload,
+#file-upload label,
+#file-upload button {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 100% !important;
+    height: 56px !important;
+    background: #1a1a1a !important;
+    border: 2px solid #ff6b35 !important;
+    border-radius: 10px !important;
+    color: #ff6b35 !important;
+    font-family: 'Syne', sans-serif !important;
+    font-size: 1.05rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.03em !important;
+    cursor: pointer !important;
+    transition: transform 0.15s, box-shadow 0.15s !important;
+    box-shadow: 0 4px 20px rgba(255, 107, 53, 0.2) !important;
+}
+#file-upload:hover,
+#file-upload label:hover,
+#file-upload button:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 8px 28px rgba(255, 107, 53, 0.4) !important;
+}
+
+/* Uploaded filename confirmation */
+#file-name { min-height: 0 !important; }
+#file-name p {
+    color: #aaa !important;
+    font-size: 0.82rem !important;
+    text-align: center !important;
+    margin: 2px 0 6px !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The roast button */
+#roast-btn {
+    background: linear-gradient(135deg, #ff6b35, #ff4500) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-family: 'Syne', sans-serif !important;
+    font-size: 1.05rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.03em !important;
+    padding: 14px !important;
+    transition: transform 0.15s, box-shadow 0.15s !important;
+    box-shadow: 0 4px 20px rgba(255, 107, 53, 0.35) !important;
+}
+#roast-btn:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 8px 28px rgba(255, 107, 53, 0.55) !important;
+}
+#roast-btn:active {
+    transform: translateY(0px) !important;
+}
+
+/* Output card */
+#output-card {
+    background: #1a1a1a !important;
+    border: 1px solid #2a2a2a !important;
+    border-radius: 14px !important;
+    padding: 1.5rem !important;
+    min-height: 200px !important;
+}
+
+/* Markdown inside output card */
+#output-card, #output-card * { color: #e8e8e8 !important; }
+#output-card h2 { color: #ff6b35 !important; font-family: 'Syne', sans-serif !important; }
+#output-card h3 { color: #ffffff !important; border-bottom: 1px solid #2a2a2a; padding-bottom: 4px; }
+#output-card strong { color: #ff6b35 !important; }
+#output-card p, #output-card li { color: #e8e8e8 !important; line-height: 1.7 !important; }
+#output-card hr { border-color: #2a2a2a !important; }
+#output-card code {
+    background: transparent !important;
+    color: inherit !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: inherit !important;
+    padding: 0 !important;
+    border: none !important;
+}
+
+/* Disclaimer text */
+#disclaimer { color: #888 !important; font-size: 0.8rem !important; }
+
+
+/* Hide Gradio footer */
+footer { display: none !important; }
+"""
+
+# ─────────────────────────────────────────────
+#  JAVASCRIPT
+#  Runs on page load:
+#  - Adds a 🔥 favicon dynamically
+#  - Animates the score when it appears in output
+# ─────────────────────────────────────────────
+JS = """
+() => {
+    // Set a fire emoji as the browser tab favicon
+    const link = document.createElement('link');
+    link.rel = 'icon';
+    link.href = 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔥</text></svg>';
+    document.head.appendChild(link);
+
+    // Watch DOM for score animation trigger
+    const observer = new MutationObserver(() => {
+
+        // --- Score pulse animation ---
+        const scoreEl = document.querySelector('#output-card h2');
+        if (scoreEl && !scoreEl.dataset.animated) {
+            scoreEl.dataset.animated = 'true';
+            scoreEl.style.transition = 'transform 0.3s ease, opacity 0.3s ease';
+            scoreEl.style.transform = 'scale(1.08)';
+            scoreEl.style.opacity = '0.7';
+            setTimeout(() => {
+                scoreEl.style.transform = 'scale(1)';
+                scoreEl.style.opacity = '1';
+            }, 350);
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+}
+"""
+
+# ─────────────────────────────────────────────
 #  GRADIO UI
-#  gr.Blocks gives us full layout control.
-#  The UI has two columns: upload + button on
-#  the left, streaming output on the right.
 # ─────────────────────────────────────────────
 with gr.Blocks(title="Resume Roast") as app:
 
-    # Page header
+    # Header
     gr.Markdown("""
 # Resume Roast
-### Upload your resume. Get the honest feedback no recruiter will ever give you.
-""")
+### Your resume. Judged. Mercilessly.
+""", elem_id="headline")
 
     with gr.Row():
 
-        # Left column: file upload and trigger button
-        with gr.Column(scale=1):
-            file_input = gr.File(
-                label="Your Resume (PDF only)",
-                file_types=[".pdf"],   # Restricts the file picker to PDFs only
-                type="filepath"        # Tells Gradio to pass the path string, not file bytes
+        # Left: upload + button
+        with gr.Column(scale=1, elem_classes=["upload-container"]):
+            # gr.State holds the uploaded filepath between upload and roast click
+            file_state = gr.State(None)
+            # UploadButton always opens the file picker on every click (unlike gr.File)
+            file_input = gr.UploadButton(
+                "Upload Resume (PDF)",
+                file_types=[".pdf"],
+                type="filepath",
+                elem_id="file-upload"
             )
-            roast_btn = gr.Button("Roast My Resume", variant="primary", size="lg")
-            gr.Markdown("_Your file is read locally and never stored._")
+            file_name = gr.Markdown("", elem_id="file-name")
+            roast_btn = gr.Button(
+                "🔥 Roast My Resume",
+                variant="primary",
+                size="lg",
+                elem_id="roast-btn"
+            )
+            gr.Markdown("_Read locally. Never stored. No mercy._", elem_id="disclaimer")
 
-        # Right column: where the streaming roast output appears
+        # Right: streaming output
         with gr.Column(scale=2):
-            # gr.Markdown renders the response with formatting (bold, headers, etc.)
-            output = gr.Markdown(value="_Your roast will appear here..._")
+            output = gr.Markdown(
+                value="_Your resume roast will appear here..._",
+                elem_id="output-card"
+            )
 
-    # Wire the button click to roast_resume.
-    # Because roast_resume is a generator, Gradio streams each yielded
-    # value into `output` automatically.
-    roast_btn.click(
-        fn=roast_resume,
+    # On upload: store filepath in state and show filename
+    file_input.upload(
+        fn=lambda f: (f, show_filename(f)),
         inputs=file_input,
-        outputs=output,
-        show_progress="minimal"  # Shows a subtle spinner while waiting
+        outputs=[file_state, file_name]
     )
 
-# Only launch the server when this file is run directly,
-# not when it's imported as a module.
+    roast_btn.click(
+        fn=roast_resume,
+        inputs=file_state,
+        outputs=output,
+        show_progress="minimal"
+    )
+
 if __name__ == "__main__":
     app.launch(
-        theme=gr.themes.Soft(primary_hue="orange", neutral_hue="slate"),
-        css="footer { display: none !important; }"  # Hides the Gradio branding footer
+        theme=gr.themes.Soft(primary_hue="orange", neutral_hue="zinc"),
+        css=CSS,
+        js=JS
     )
